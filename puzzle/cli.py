@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
     default=2
 )
 @click.option('-f', '--family_file',
-    type=click.File('r')
+    type=click.Path(exist=True)
 )
 @click.option('-t' ,'--family_type', 
                 type=click.Choice(['ped', 'alt']), 

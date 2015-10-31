@@ -1,0 +1,4 @@
+#FamilyID	SampleID	Father	Mother	Sex	Phenotype
+HapMap	NA12877	0	0	1	1
+HapMap	NA12882	NA12877	NA12878	1	2
+HapMap	NA12878	0	0	2	1

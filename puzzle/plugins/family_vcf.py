@@ -4,7 +4,8 @@ import logging
 
 from path import path
 
-from puzzle.models import (Case, Compound, Variant, Gene, Genotype, Transcript)
+from puzzle.models import (Case, Compound, Variant, Gene, Genotype, Transcript,
+                            Individual)
 from puzzle.utils import (get_most_severe_consequence, get_hgnc_symbols,
                           get_omim_number, get_ensembl_id)
 
@@ -17,26 +18,82 @@ from ped_parser import FamilyParser
 
 logger = logging.getLogger(__name__)
 
-class VcfPlugin(Plugin):
-    """docstring for Plugin"""
+class FamilyPlugin(Plugin):
+    """Plugin for dealing with vcf files when using a family file.
+        
+        In this case only one vcf is used but it can include multiple
+        cases. Since we know from the family file what individuals is included
+        we can save the information in a different way than in the VcfPlugin
+    """
     
     def __init__(self):
-        super(VcfPlugin, self).__init__()
+        super(FamilyPlugin, self).__init__()
     
     def init_app(self, app):
         """Initialize plugin via Flask."""
         logger.debug("Updating root path to {0}".format(
             app.config['PUZZLE_ROOT']
         ))
-        self.root_path = app.config['PUZZLE_ROOT']
-        logger.debug("Updating pattern to {0}".format(
-            app.config['PUZZLE_PATTERN']
-        ))
-        self.pattern = app.config['PUZZLE_PATTERN']
-    
-    def _find_vcfs(self, pattern='*.vcf'):
-        """Walk subdirectories and return VCF files."""
-        return path(self.root_path).walkfiles(pattern)
+        self.vcf_path = app.config['PUZZLE_ROOT']
+        self.head = self._get_header(self.vcf_path)
+
+        self.case_objs = []
+        self.individuals = []
+
+        self.header_line = self.head.header
+        vcf_individuals = self.head.individuals
+        
+        case_ids = set()
+        with open(app.config['FAMILY_FILE'], 'r') as family_file:
+            family_parser = FamilyParser(
+                family_info=family_file,
+                family_type=app.config['FAMILY_TYPE']
+                )
+        
+        for ind_id in family_parser.individuals:
+            individual = family_parser.individuals[ind_id]
+            logger.info("Found individual {0} with family id {1}".format(
+                ind_id, individual.family))
+            
+            if ind_id not in vcf_individuals:
+                logger.error("Individual {0} is not in vcf".format(
+                    individual
+                ))
+                logger.info("All individuals from ped file has to be present in"\
+                            "the vcf file.")
+                ##TODO raise a more specific exception here
+                raise SyntaxError
+            
+            self.individuals.append(
+                Individual(
+                    ind_id=individual.individual_id, 
+                    case_id=individual.family, 
+                    mother=individual.mother, 
+                    father=individual.father,
+                    sex=individual.sex,
+                    phenotype=individual.phenotype,
+                    variant_source=self.vcf_path, 
+                    bam_path=None)
+            )
+            
+            case_ids.add(individual.family)
+        
+        # Add the cases to the adapter
+        for case_id in case_ids:
+            case = Case(
+                case_id=case_id,
+                name=case_id
+                )
+            # Add the individuals to the correct case
+            for individual in self.individuals:
+                if individual['case_id'] == case_id:
+                    logger.info("Adding ind {0} to case {1}".format(
+                        individual['name'], individual['case_id']
+                    ))
+                    case.add_individual(individual)
+            logger.info("Adding case {0} to adapter.".format(case_id))
+            self.case_objs.append(case)
+        
     
     def _get_header(self, vcf_file_path):
         """Return a HeaderParser
@@ -54,25 +111,17 @@ class VcfPlugin(Plugin):
                 line = line.rstrip()
                 if line.startswith('#'):
                     if line.startswith('##'):
-                        self.head.parse_meta_data(line)
+                        head.parse_meta_data(line)
                     else:
-                        self.head.parse_header_line(line)
+                        head.parse_header_line(line)
                 else:
                     break
         return head
     
+    
     def cases(self, pattern=None):
         """Return all VCF file paths."""
-        pattern = pattern or self.pattern
         
-        #If pointing to a single file
-        if os.path.isfile(self.root_path):
-            vcfs = [path(self.root_path)]
-        else:
-            vcfs = self._find_vcfs(pattern)
-        
-        case_objs = (Case(case_id=vcf.replace('/', '|'),
-                          name=vcf.basename()) for vcf in vcfs)
         return case_objs
 
     def _add_compounds(self, variant, info_dict):
@@ -148,8 +197,18 @@ class VcfPlugin(Plugin):
         return transcripts
 
     def _variants(self, vcf_file_path):
-        
-        head = self._get_header(vcf_file_path)
+        head = HeaderParser()
+        # Parse the header
+        with open(vcf_file_path, 'r') as variant_file:
+            for line in variant_file:
+                line = line.rstrip()
+                if line.startswith('#'):
+                    if line.startswith('##'):
+                        head.parse_meta_data(line)
+                    else:
+                        head.parse_header_line(line)
+                else:
+                    break
 
         header_line = head.header
         individuals = head.individuals
@@ -203,7 +262,7 @@ class VcfPlugin(Plugin):
                         logger.debug("Updating thousand_g to: {0}".format(
                             thousand_g))
                         variant['thousand_g'] = float(thousand_g)
-                        variant.add_frequency('1000GAF', thousand_g)
+                    variant.add_frequency('1000GAF', variant.get('thousand_g'))
 
                     cadd_score = info_dict.get('CADD')
                     if cadd_score:
@@ -258,12 +317,10 @@ class VcfPlugin(Plugin):
                     
                     self._add_compounds(variant=variant, info_dict=info_dict)
                     
-                    variant.set_max_freq()
-                    
                     yield variant
 
     def variants(self, case_id, skip=0, count=30, gene_list=None,
-                 frequency=None):
+                 thousand_g=None):
         """Return all variants in the VCF.
 
             Args:
@@ -271,7 +328,7 @@ class VcfPlugin(Plugin):
                 skip (int): Skip first variants
                 count (int): The number of variants to return
                 gene_list (list): A list of genes
-                frequency (float): filter variants based on frequency
+                thousand_g (float): filter variants based on frequency
         """
         vcf_path = case_id.replace('|', '/')
         limit = count + skip
@@ -283,13 +340,13 @@ class VcfPlugin(Plugin):
             filtered_variants = (variant for variant in filtered_variants
                                  if (set(gene['symbol'] for gene in variant['genes'])
                                      .intersection(gene_list)))
-        if frequency:
+        if thousand_g:
             filtered_variants = (variant for variant in filtered_variants
-                                 if variant['max_freq'] <= thousand_g)
+                                 if variant['thousand_g'] <= thousand_g)
 
         for index, variant_obj in enumerate(filtered_variants):
             if index >= skip:
-                if index < limit:
+                if index <= limit:
                     yield variant_obj
                 else:
                     break
